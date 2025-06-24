@@ -27,4 +27,3 @@ try await downloader.start { downloaded, total, speed, remaining in
 ## License
 
 MIT
-"""
