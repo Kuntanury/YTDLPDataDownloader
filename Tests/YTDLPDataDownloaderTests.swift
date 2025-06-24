@@ -1,14 +1,14 @@
 import XCTest
-@testable import YTDLPDownloader
+@testable import YTDLPDataDownloader
 
-final class YTDLPDownloaderTests: XCTestCase {
+final class YTDLPDataDownloaderTests: XCTestCase {
     func testExampleDownload() async throws {
         let testURL = URL(string: "https://speed.hetzner.de/100MB.bin")!
         let destination = FileManager.default.temporaryDirectory.appendingPathComponent("test_100MB.bin")
-        let downloader = YTDLPDownloader(url: testURL, destination: destination, maxThreads: 2)
+        let downloader = YTDLPDataDownloader(url: testURL, destination: destination, maxThreads: 2)
 
         try await downloader.start { downloaded, total, speed, remaining in
-            print("Progress: \\(downloaded)/\\(total), Speed: \\(speed), Remaining: \\(remaining)")
+            print("Progress: \(downloaded)/\\(total), Speed: \(speed), Remaining: \(remaining)")
         }
 
         XCTAssertTrue(FileManager.default.fileExists(atPath: destination.path))
