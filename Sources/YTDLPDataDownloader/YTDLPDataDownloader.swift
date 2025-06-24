@@ -36,7 +36,7 @@ public class YTDLPDataDownloader {
     public func start(progress: ((Int64, Int64, Double, Double) -> Void)? = nil) async throws {
         let (supportsRange, totalSize) = try await checkRangeSupport()
         guard supportsRange else {
-            throw URLError(.cannotResume)
+            throw URLError(.badServerResponse)
         }
 
         let chunkSize = totalSize / Int64(maxThreads)
