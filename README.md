@@ -19,8 +19,8 @@ let downloader = YTDLPDownloader(
 )
 
 try await downloader.start { downloaded, total, speed, remaining in
-    print("Progress: \\(Double(downloaded) / Double(total) * 100)%")
-    print("Speed: \\(speed / 1024) KB/s, Remaining: \\(remaining) sec")
+    print("Progress: \(Double(downloaded) / Double(total) * 100)%")
+    print("Speed: \(speed / 1024) KB/s, Remaining: \(remaining) sec")
 }
 ```
 
