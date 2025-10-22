@@ -74,7 +74,6 @@ public class YTDLPDataDownloader {
     private func checkRangeSupport() async throws -> (Bool, Int64) {
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
-        request.setValue("bytes=0-", forHTTPHeaderField: "Range")
         let (_, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
