@@ -78,7 +78,7 @@ public class YTDLPDataDownloader {
         guard let http = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
         }
-        let supportsRange = http.statusCode == 206 || http.allHeaderFields["Accept-Ranges"] as? String == "bytes"
+        let supportsRange = (200...299).contains(http.statusCode) || http.allHeaderFields["Accept-Ranges"] as? String == "bytes"
         let lengthHeader = http.allHeaderFields["Content-Length"] as? String
         let totalSize = Int64(lengthHeader ?? "0") ?? 0
         return (supportsRange, totalSize)
