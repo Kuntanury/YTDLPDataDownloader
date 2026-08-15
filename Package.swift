@@ -4,7 +4,8 @@ import PackageDescription
 let package = Package(
     name: "YTDLPDataDownloader",
     platforms: [
-        .iOS(.v14)
+        .iOS(.v14),
+        .macOS(.v12)
     ],
     products: [
         .library(
@@ -19,7 +20,8 @@ let package = Package(
         ),
         .testTarget(
             name: "YTDLPDataDownloaderTests",
-            dependencies: ["YTDLPDataDownloader"]
+            dependencies: ["YTDLPDataDownloader"],
+            path: "Tests"
         ),
     ]
 )
