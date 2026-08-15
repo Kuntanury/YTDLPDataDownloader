@@ -3,16 +3,20 @@ import Foundation
 public actor ProgressTracker {
     var downloaded: Int64 = 0
     let total: Int64
+    let initialDownloaded: Int64
     let startTime = Date()
 
-    public init(total: Int64) {
+    public init(total: Int64, downloaded: Int64 = 0) {
         self.total = total
+        self.initialDownloaded = downloaded
+        self.downloaded = downloaded
     }
 
     public func update(by count: Int64) -> (downloaded: Int64, speed: Double, remaining: Double) {
         downloaded += count
         let elapsed = max(Date().timeIntervalSince(startTime), 0.001)
-        let speed = Double(downloaded) / elapsed
+        let transferred = max(downloaded - initialDownloaded, 0)
+        let speed = Double(transferred) / elapsed
         let remaining = speed > 0 ? Double(total - downloaded) / speed : 0
         return (downloaded, speed, remaining)
     }
@@ -70,11 +74,16 @@ public final class YTDLPDataDownloader {
     public let requestHeaders: [String: String]
     public let maxThreads: Int
     public let retryCount: Int
+    public let resumePartialDownload: Bool
 
     typealias RetryDelay = (_ failedAttempt: Int) async throws -> Void
 
     private static let defaultUserAgent =
         "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+    private static let googleVideoInitialChunkSize: Int64 = 256 * 1024
+    private static let googleVideoMinimumChunkSize: Int64 = 64 * 1024
+    private static let googleVideoMaximumChunkSize: Int64 = 512 * 1024
+    private static let googleVideoChunkTimeout: TimeInterval = 20
 
     private let session: URLSession
     private let retryDelay: RetryDelay
@@ -84,13 +93,15 @@ public final class YTDLPDataDownloader {
         destination: URL,
         headers: [String: String] = [:],
         maxThreads: Int = 4,
-        retryCount: Int = 3
+        retryCount: Int = 3,
+        resumePartialDownload: Bool = false
     ) {
         self.url = url
         self.destination = destination
         self.requestHeaders = headers
         self.maxThreads = maxThreads
         self.retryCount = max(1, retryCount)
+        self.resumePartialDownload = resumePartialDownload
 
         let config = URLSessionConfiguration.ephemeral
         config.waitsForConnectivity = true
@@ -106,7 +117,8 @@ public final class YTDLPDataDownloader {
         request: URLRequest,
         destination: URL,
         maxThreads: Int = 4,
-        retryCount: Int = 3
+        retryCount: Int = 3,
+        resumePartialDownload: Bool = false
     ) {
         guard let url = request.url else {
             preconditionFailure("YTDLPDataDownloader requires a request URL")
@@ -116,7 +128,8 @@ public final class YTDLPDataDownloader {
             destination: destination,
             headers: request.allHTTPHeaderFields ?? [:],
             maxThreads: maxThreads,
-            retryCount: retryCount
+            retryCount: retryCount,
+            resumePartialDownload: resumePartialDownload
         )
     }
 
@@ -126,6 +139,7 @@ public final class YTDLPDataDownloader {
         headers: [String: String] = [:],
         maxThreads: Int = 4,
         retryCount: Int = 3,
+        resumePartialDownload: Bool = false,
         session: URLSession,
         retryDelay: @escaping RetryDelay
     ) {
@@ -134,6 +148,7 @@ public final class YTDLPDataDownloader {
         self.requestHeaders = headers
         self.maxThreads = maxThreads
         self.retryCount = max(1, retryCount)
+        self.resumePartialDownload = resumePartialDownload
         self.session = session
         self.retryDelay = retryDelay
     }
@@ -152,7 +167,11 @@ public final class YTDLPDataDownloader {
             let effectiveThreads = max(1, min(requestedThreads, Int(totalSize)))
 
             if effectiveThreads <= 1 {
-                try await downloadSequential(totalSize: totalSize, progress: progress)
+                try await downloadSequential(
+                    totalSize: totalSize,
+                    isGoogleVideo: isGoogleVideo,
+                    progress: progress
+                )
             } else {
                 try await downloadConcurrently(
                     totalSize: totalSize,
@@ -224,40 +243,102 @@ public final class YTDLPDataDownloader {
 
     private func downloadSequential(
         totalSize: Int64,
+        isGoogleVideo: Bool,
         progress: ((Int64, Int64, Double, Double) -> Void)?
     ) async throws {
-        let tracker = ProgressTracker(total: totalSize)
         let fileManager = FileManager.default
         let temporaryURL = destination
             .deletingLastPathComponent()
             .appendingPathComponent(destination.lastPathComponent + ".part")
 
-        if fileManager.fileExists(atPath: temporaryURL.path) {
+        var offset: Int64 = 0
+        if resumePartialDownload,
+           let attributes = try? fileManager.attributesOfItem(atPath: temporaryURL.path),
+           let fileSize = attributes[.size] as? NSNumber,
+           fileSize.int64Value > 0,
+           fileSize.int64Value < totalSize {
+            offset = fileSize.int64Value
+        } else if fileManager.fileExists(atPath: temporaryURL.path) {
             try? fileManager.removeItem(at: temporaryURL)
         }
-        fileManager.createFile(atPath: temporaryURL.path, contents: nil)
+        let tracker = ProgressTracker(total: totalSize, downloaded: offset)
+        if !fileManager.fileExists(atPath: temporaryURL.path) {
+            fileManager.createFile(atPath: temporaryURL.path, contents: nil)
+        }
         let handle = try FileHandle(forWritingTo: temporaryURL)
+        if offset > 0 {
+            try handle.seekToEnd()
+        }
         var completed = false
+        var preservePartial = false
         defer {
             try? handle.close()
-            if !completed {
+            if !completed && !preservePartial {
                 try? fileManager.removeItem(at: temporaryURL)
             }
         }
 
-        let step: Int64 = 2 * 1024 * 1024
-        var offset: Int64 = 0
-        while offset < totalSize {
-            try Task.checkCancellation()
-            let end = min(offset + step, totalSize)
-            let data = try await downloadRangeWithRetry(range: offset..<end, totalSize: totalSize)
-            try handle.write(contentsOf: data)
+        var step = isGoogleVideo ? Self.googleVideoInitialChunkSize : 2 * 1024 * 1024
+        var fastChunkCount = 0
+        var failedAttemptsAtOffset = 0
 
-            if let progress {
-                let state = await tracker.update(by: Int64(data.count))
-                progress(state.downloaded, totalSize, state.speed, state.remaining)
+        do {
+            while offset < totalSize {
+                try Task.checkCancellation()
+                let end = min(offset + step, totalSize)
+                let startedAt = Date()
+                let data: Data
+                do {
+                    data = try await downloadRangeWithRetry(
+                        range: offset..<end,
+                        totalSize: totalSize,
+                        maximumAttempts: isGoogleVideo ? 1 : nil,
+                        hardTimeout: isGoogleVideo ? Self.googleVideoChunkTimeout : nil
+                    )
+                } catch let error as YTDLPDownloadError {
+                    if error.shouldRefreshSource {
+                        preservePartial = resumePartialDownload && offset > 0
+                        throw error
+                    }
+                    guard isGoogleVideo,
+                          failedAttemptsAtOffset + 1 < retryCount,
+                          isRetryable(error) else {
+                        throw error
+                    }
+
+                    failedAttemptsAtOffset += 1
+                    fastChunkCount = 0
+                    step = max(Self.googleVideoMinimumChunkSize, step / 2)
+                    try await retryDelay(failedAttemptsAtOffset)
+                    continue
+                }
+
+                try handle.write(contentsOf: data)
+
+                if let progress {
+                    let state = await tracker.update(by: Int64(data.count))
+                    progress(state.downloaded, totalSize, state.speed, state.remaining)
+                }
+                offset = end
+                failedAttemptsAtOffset = 0
+
+                guard isGoogleVideo else { continue }
+                let elapsed = Date().timeIntervalSince(startedAt)
+                if elapsed <= 2 {
+                    fastChunkCount += 1
+                    if fastChunkCount >= 3 {
+                        step = min(Self.googleVideoMaximumChunkSize, step * 2)
+                        fastChunkCount = 0
+                    }
+                } else {
+                    fastChunkCount = 0
+                    if elapsed >= 10 {
+                        step = max(Self.googleVideoMinimumChunkSize, step / 2)
+                    }
+                }
             }
-            offset = end
+        } catch {
+            throw error
         }
 
         try handle.close()
@@ -294,6 +375,7 @@ public final class YTDLPDataDownloader {
     }
 
     private func downloadStrategy() async throws -> DownloadStrategy {
+        let isGoogleVideo = url.host?.contains("googlevideo.com") == true
         do {
             let head = makeRequest(method: "HEAD", range: nil, timeout: 30)
             let result = try await performWithRetry(stage: .rangeCheckHead, request: head) { _, response, attempt in
@@ -315,8 +397,13 @@ public final class YTDLPDataDownloader {
         }
 
         let probeRange: Range<Int64> = 0..<1
-        let probe = makeRequest(method: "GET", range: probeRange, timeout: 30)
-        let result = try await performWithRetry(stage: .rangeCheckProbe, request: probe) { data, response, attempt in
+        let probeTimeout = isGoogleVideo ? Self.googleVideoChunkTimeout : 30
+        let probe = makeRequest(method: "GET", range: probeRange, timeout: probeTimeout)
+        let result = try await performWithRetry(
+            stage: .rangeCheckProbe,
+            request: probe,
+            hardTimeout: probeTimeout
+        ) { data, response, attempt in
             guard response.statusCode == 200 || response.statusCode == 206 else {
                 throw self.httpError(stage: .rangeCheckProbe, response: response, attempt: attempt)
             }
@@ -347,9 +434,19 @@ public final class YTDLPDataDownloader {
         return .direct(nil)
     }
 
-    private func downloadRangeWithRetry(range: Range<Int64>, totalSize: Int64) async throws -> Data {
-        let request = makeRequest(method: "GET", range: range, timeout: 30)
-        let result = try await performWithRetry(stage: .rangeDownload, request: request) { data, response, attempt in
+    private func downloadRangeWithRetry(
+        range: Range<Int64>,
+        totalSize: Int64,
+        maximumAttempts: Int? = nil,
+        hardTimeout: TimeInterval? = nil
+    ) async throws -> Data {
+        let request = makeRequest(method: "GET", range: range, timeout: hardTimeout ?? 30)
+        let result = try await performWithRetry(
+            stage: .rangeDownload,
+            request: request,
+            maximumAttempts: maximumAttempts,
+            hardTimeout: hardTimeout
+        ) { data, response, attempt in
             _ = try self.validateRangeResponse(
                 data,
                 response: response,
@@ -365,14 +462,17 @@ public final class YTDLPDataDownloader {
     private func performWithRetry(
         stage: YTDLPDownloadError.Stage,
         request: URLRequest,
+        maximumAttempts: Int? = nil,
+        hardTimeout: TimeInterval? = nil,
         validation: (_ data: Data, _ response: HTTPURLResponse, _ attempt: Int) throws -> Void
     ) async throws -> (data: Data, response: HTTPURLResponse) {
         var lastError: YTDLPDownloadError?
+        let maximumAttempts = max(1, min(maximumAttempts ?? retryCount, retryCount))
 
-        for attempt in 1...retryCount {
+        for attempt in 1...maximumAttempts {
             try Task.checkCancellation()
             do {
-                let (data, response) = try await session.data(for: request)
+                let (data, response) = try await performDataRequest(request, hardTimeout: hardTimeout)
                 guard let httpResponse = response as? HTTPURLResponse else {
                     throw makeError(stage: stage, kind: .invalidResponse, attempt: attempt)
                 }
@@ -385,14 +485,40 @@ public final class YTDLPDataDownloader {
             } catch {
                 let normalized = normalize(error, stage: stage, attempt: attempt)
                 lastError = normalized
-                guard attempt < retryCount, isRetryable(normalized) else {
+                guard attempt < maximumAttempts, isRetryable(normalized) else {
                     throw normalized
                 }
                 try await retryDelay(attempt)
             }
         }
 
-        throw lastError ?? makeError(stage: stage, kind: .invalidResponse, attempt: retryCount)
+        throw lastError ?? makeError(stage: stage, kind: .invalidResponse, attempt: maximumAttempts)
+    }
+
+    private func performDataRequest(
+        _ request: URLRequest,
+        hardTimeout: TimeInterval?
+    ) async throws -> (Data, URLResponse) {
+        guard let hardTimeout else {
+            return try await session.data(for: request)
+        }
+
+        return try await withThrowingTaskGroup(of: (Data, URLResponse).self) { group in
+            group.addTask {
+                try await self.session.data(for: request)
+            }
+            group.addTask {
+                let nanoseconds = UInt64(max(0.1, hardTimeout) * 1_000_000_000)
+                try await Task.sleep(nanoseconds: nanoseconds)
+                throw URLError(.timedOut)
+            }
+
+            guard let result = try await group.next() else {
+                throw URLError(.unknown)
+            }
+            group.cancelAll()
+            return result
+        }
     }
 
     private func validateDirectDownload(

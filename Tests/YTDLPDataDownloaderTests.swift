@@ -184,11 +184,133 @@ final class YTDLPDataDownloaderTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: destination.path + ".part"))
     }
 
+    func testGoogleVideoUsesSmallAdaptiveRanges() async throws {
+        let source = URL(string: "https://rr.example.googlevideo.com/videoplayback")!
+        let destination = temporaryDestination()
+        let totalSize = 1_400_000
+        defer {
+            try? FileManager.default.removeItem(at: destination)
+            try? FileManager.default.removeItem(atPath: destination.path + ".part")
+        }
+
+        let recorder = RequestRecorder()
+        MockURLProtocol.requestHandler = { request in
+            recorder.append(request)
+            if request.httpMethod == "HEAD" {
+                return Self.response(
+                    request: request,
+                    statusCode: 200,
+                    headers: ["Accept-Ranges": "bytes", "Content-Length": "\(totalSize)"]
+                )
+            }
+
+            let range = try XCTUnwrap(Self.requestedRange(request))
+            return Self.response(
+                request: request,
+                statusCode: 206,
+                headers: [
+                    "Content-Range": "bytes \(range.lowerBound)-\(range.upperBound - 1)/\(totalSize)",
+                    "Content-Length": "\(range.count)",
+                ],
+                data: Data(repeating: 1, count: range.count)
+            )
+        }
+
+        let downloader = makeDownloader(source: source, destination: destination)
+        try await downloader.start()
+
+        let rangeHeaders = recorder.snapshot().compactMap {
+            $0.value(forHTTPHeaderField: "Range")
+        }
+        XCTAssertEqual(
+            rangeHeaders,
+            [
+                "bytes=0-262143",
+                "bytes=262144-524287",
+                "bytes=524288-786431",
+                "bytes=786432-1310719",
+                "bytes=1310720-1399999",
+            ]
+        )
+        XCTAssertEqual(try Data(contentsOf: destination).count, totalSize)
+    }
+
+    func testResumesPartialGoogleVideoDownloadAfterAuthenticationRefresh() async throws {
+        let source = URL(string: "https://rr.example.googlevideo.com/videoplayback")!
+        let destination = temporaryDestination()
+        let partial = URL(fileURLWithPath: destination.path + ".part")
+        let totalSize = 700_000
+        var firstRun = true
+        var successfulRanges = [Range<Int>]()
+        defer {
+            try? FileManager.default.removeItem(at: destination)
+            try? FileManager.default.removeItem(at: partial)
+        }
+
+        MockURLProtocol.requestHandler = { request in
+            if request.httpMethod == "HEAD" {
+                return Self.response(
+                    request: request,
+                    statusCode: 200,
+                    headers: ["Accept-Ranges": "bytes", "Content-Length": "\(totalSize)"]
+                )
+            }
+
+            let range = try XCTUnwrap(Self.requestedRange(request))
+            if firstRun, range.lowerBound > 0 {
+                return Self.response(request: request, statusCode: 403)
+            }
+            successfulRanges.append(range)
+            return Self.response(
+                request: request,
+                statusCode: 206,
+                headers: [
+                    "Content-Range": "bytes \(range.lowerBound)-\(range.upperBound - 1)/\(totalSize)",
+                    "Content-Length": "\(range.count)",
+                ],
+                data: Data(repeating: 2, count: range.count)
+            )
+        }
+
+        let firstDownloader = makeDownloader(
+            source: source,
+            destination: destination,
+            retryCount: 3,
+            resumePartialDownload: true
+        )
+        do {
+            try await firstDownloader.start()
+            XCTFail("Expected the signed URL to require refresh")
+        } catch let error as YTDLPDownloadError {
+            XCTAssertEqual(error.statusCode, 403)
+            XCTAssertTrue(error.shouldRefreshSource)
+        }
+        XCTAssertEqual(
+            (try FileManager.default.attributesOfItem(atPath: partial.path)[.size] as? NSNumber)?.intValue,
+            256 * 1024
+        )
+
+        firstRun = false
+        successfulRanges.removeAll()
+        let refreshedDownloader = makeDownloader(
+            source: source,
+            destination: destination,
+            retryCount: 3,
+            resumePartialDownload: true
+        )
+        try await refreshedDownloader.start()
+
+        XCTAssertEqual(successfulRanges.first?.lowerBound, 256 * 1024)
+        XCTAssertEqual(try Data(contentsOf: destination).count, totalSize)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
+    }
+
     private func makeDownloader(
         source: URL,
         destination: URL,
         headers: [String: String] = [:],
-        retryCount: Int = 1
+        retryCount: Int = 1,
+        resumePartialDownload: Bool = false
     ) -> YTDLPDataDownloader {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -199,6 +321,7 @@ final class YTDLPDataDownloaderTests: XCTestCase {
             headers: headers,
             maxThreads: 4,
             retryCount: retryCount,
+            resumePartialDownload: resumePartialDownload,
             session: session,
             retryDelay: { _ in }
         )
@@ -222,6 +345,16 @@ final class YTDLPDataDownloaderTests: XCTestCase {
             headerFields: headers
         )!
         return (response, data)
+    }
+
+    private static func requestedRange(_ request: URLRequest) -> Range<Int>? {
+        guard let value = request.value(forHTTPHeaderField: "Range"),
+              value.hasPrefix("bytes=") else {
+            return nil
+        }
+        let bounds = value.dropFirst("bytes=".count).split(separator: "-").compactMap { Int($0) }
+        guard bounds.count == 2, bounds[0] <= bounds[1] else { return nil }
+        return bounds[0]..<(bounds[1] + 1)
     }
 }
 
