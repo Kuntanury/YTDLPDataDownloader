@@ -569,7 +569,7 @@ public final class YTDLPDataDownloader {
                 kind: .invalidContentRange,
                 statusCode: response.statusCode,
                 attempt: attempt,
-                details: "expected_status=206"
+                details: "expected_status=206 requested=bytes \(expectedRange.lowerBound)-\(expectedRange.upperBound - 1)/\(totalSize.map(String.init) ?? "*")"
             )
         }
         guard let value = response.value(forHTTPHeaderField: "Content-Range"),

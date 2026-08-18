@@ -284,6 +284,10 @@ final class YTDLPDataDownloaderTests: XCTestCase {
         } catch let error as YTDLPDownloadError {
             XCTAssertEqual(error.statusCode, 403)
             XCTAssertTrue(error.shouldRefreshSource)
+            XCTAssertEqual(
+                error.details,
+                "expected_status=206 requested=bytes 262144-524287/700000"
+            )
         }
         XCTAssertEqual(
             (try FileManager.default.attributesOfItem(atPath: partial.path)[.size] as? NSNumber)?.intValue,
