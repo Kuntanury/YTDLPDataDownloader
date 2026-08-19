@@ -82,7 +82,7 @@ public final class YTDLPDataDownloader {
         "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
     private static let googleVideoInitialChunkSize: Int64 = 256 * 1024
     private static let googleVideoMinimumChunkSize: Int64 = 64 * 1024
-    private static let googleVideoMaximumChunkSize: Int64 = 512 * 1024
+    private static let googleVideoMaximumChunkSize: Int64 = 1024 * 1024
     private static let googleVideoChunkTimeout: TimeInterval = 20
 
     private let session: URLSession

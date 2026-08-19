@@ -235,6 +235,58 @@ final class YTDLPDataDownloaderTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: destination).count, totalSize)
     }
 
+    func testGoogleVideoGrowsToOneMiBAfterSustainedFastDownloads() async throws {
+        let source = URL(string: "https://rr.example.googlevideo.com/videoplayback")!
+        let destination = temporaryDestination()
+        let totalSize = 3_500_000
+        defer {
+            try? FileManager.default.removeItem(at: destination)
+            try? FileManager.default.removeItem(atPath: destination.path + ".part")
+        }
+
+        let recorder = RequestRecorder()
+        MockURLProtocol.requestHandler = { request in
+            recorder.append(request)
+            if request.httpMethod == "HEAD" {
+                return Self.response(
+                    request: request,
+                    statusCode: 200,
+                    headers: ["Accept-Ranges": "bytes", "Content-Length": "\(totalSize)"]
+                )
+            }
+
+            let range = try XCTUnwrap(Self.requestedRange(request))
+            return Self.response(
+                request: request,
+                statusCode: 206,
+                headers: [
+                    "Content-Range": "bytes \(range.lowerBound)-\(range.upperBound - 1)/\(totalSize)",
+                    "Content-Length": "\(range.count)",
+                ],
+                data: Data(repeating: 1, count: range.count)
+            )
+        }
+
+        let downloader = makeDownloader(source: source, destination: destination)
+        try await downloader.start()
+
+        let requestedSizes = recorder.snapshot().compactMap(Self.requestedRange).map(\.count)
+        XCTAssertEqual(
+            requestedSizes,
+            [
+                256 * 1024,
+                256 * 1024,
+                256 * 1024,
+                512 * 1024,
+                512 * 1024,
+                512 * 1024,
+                1024 * 1024,
+                totalSize - (3 * 256 * 1024) - (3 * 512 * 1024) - (1024 * 1024),
+            ]
+        )
+        XCTAssertEqual(try Data(contentsOf: destination).count, totalSize)
+    }
+
     func testResumesPartialGoogleVideoDownloadAfterAuthenticationRefresh() async throws {
         let source = URL(string: "https://rr.example.googlevideo.com/videoplayback")!
         let destination = temporaryDestination()
